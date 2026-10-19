@@ -76,10 +76,18 @@
   let started = false, paused = true;
   const overlay = el("overlay");
   function openSettings() { paused = true; overlay.classList.remove("hidden"); el("start").textContent = started ? "New match" : "Play"; }
+  async function goFullscreenLandscape() {
+    // phones: fill the screen and ask for landscape (Android Chrome honours it; iOS ignores, we show the rotate hint)
+    if (!isTouchDevice()) return;
+    try { if (!document.fullscreenElement && document.documentElement.requestFullscreen) await document.documentElement.requestFullscreen({ navigationUI: "hide" }); } catch {}
+    try { if (screen.orientation && screen.orientation.lock) await screen.orientation.lock("landscape"); } catch {}
+    setTimeout(fitCanvas, 300); setTimeout(fitCanvas, 1000);
+  }
   el("start").onclick = async () => {
     try { await newMatch(); }
     catch (e) { alert(`Could not start: ${e.message}`); return; }
     started = true; paused = false; overlay.classList.add("hidden"); el("start").blur();
+    goFullscreenLandscape();
   };
   el("settings").onclick = openSettings;
 
@@ -87,8 +95,12 @@
   const MARGIN = 30, W = 2 * cfg.half_w + 2 * MARGIN, H = 2 * cfg.half_h + 2 * MARGIN;
   const cv = el("c");
   const ctx = cv.getContext("2d");
+  const isTouchDevice = () => matchMedia("(pointer: coarse)").matches || navigator.maxTouchPoints > 0;
   function fitCanvas() {
-    const cssW = Math.min(window.innerWidth * 0.96, 1500, Math.max(900, (window.innerHeight - 140) * W / H));
+    const vw = Math.min(window.innerWidth, document.documentElement.clientWidth || Infinity, window.visualViewport ? window.visualViewport.width : Infinity);
+    const vh = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+    const avail = vh - (isTouchDevice() ? 44 : 140);
+    const cssW = Math.min(vw * (isTouchDevice() ? 1.0 : 0.96), 1500, Math.max(isTouchDevice() ? 300 : 900, avail * W / H), vw);
     const scale = cssW / W, dpr = window.devicePixelRatio || 1;
     cv.width = Math.round(W * scale * dpr); cv.height = Math.round(H * scale * dpr);
     document.documentElement.style.setProperty("--w", `${Math.round(cssW)}px`);
@@ -96,6 +108,8 @@
   }
   fitCanvas();
   addEventListener("resize", fitCanvas);
+  addEventListener("orientationchange", () => { setTimeout(fitCanvas, 200); setTimeout(fitCanvas, 800); });
+  if (window.visualViewport) window.visualViewport.addEventListener("resize", fitCanvas);
   const px = (x, y) => [x + cfg.half_w + MARGIN, y + cfg.half_h + MARGIN];
   const COL = { canvas: "#1c2d2b", grass: "#718c5a", line: "#c7e6bd", red: "#e56e56", blue: "#5689e5", ball: cfg.ball_color || "#ff1493", postRed: "#ffcccc", postBlue: "#ccccff", net: "#cdcdcd" };
   function circle(x, y, r, fill, stroke, lw) { const [X, Y] = px(x, y); ctx.beginPath(); ctx.arc(X, Y, r, 0, Math.PI * 2); if (fill) { ctx.fillStyle = fill; ctx.fill(); } if (stroke) { ctx.lineWidth = lw || 2; ctx.strokeStyle = stroke; ctx.stroke(); } }
@@ -141,11 +155,55 @@
     if (e.code === "KeyR") resetEpisode(0);
   });
   addEventListener("keyup", e => { if (KEYMAP[e.code]) keys.delete(KEYMAP[e.code]); });
-  for (const b of document.querySelectorAll("#pad button")) {
-    const k = KEYMAP[b.dataset.k];
-    b.addEventListener("pointerdown", e => { keys.add(k); e.preventDefault(); });
-    for (const ev of ["pointerup", "pointerleave", "pointercancel"]) b.addEventListener(ev, () => keys.delete(k));
+  // ---- touch controls: left half = virtual joystick (8 directions), right half = kick (hold) ----
+  const touchLayer = el("touch"), stick = el("stick"), knob = el("knob"), kickBtn = el("kickbtn");
+  const isTouch = matchMedia("(pointer: coarse)").matches || navigator.maxTouchPoints > 0;
+  if (isTouch) touchLayer.hidden = false;
+  let stickId = null, kickId = null, stickOrigin = null;
+  const R_STICK = 55, DEAD = 12;
+  function setDir(dx, dy) {
+    keys.delete("L"); keys.delete("R"); keys.delete("U"); keys.delete("D");
+    if (dx < 0) keys.add("L"); if (dx > 0) keys.add("R"); if (dy < 0) keys.add("U"); if (dy > 0) keys.add("D");
   }
+  function stickMove(x, y) {
+    let vx = x - stickOrigin[0], vy = y - stickOrigin[1];
+    const L = Math.hypot(vx, vy);
+    if (L > R_STICK) { vx *= R_STICK / L; vy *= R_STICK / L; }
+    knob.style.left = `${35 + vx}px`; knob.style.top = `${35 + vy}px`;
+    if (L < DEAD) { setDir(0, 0); return; }
+    const a = Math.atan2(vy, vx);  // 8 sectors of 45deg
+    const sector = Math.round(a / (Math.PI / 4));
+    const dirs = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]];
+    const [dx, dy] = dirs[((sector % 8) + 8) % 8];
+    setDir(dx, dy);
+  }
+  touchLayer.addEventListener("pointerdown", e => {
+    e.preventDefault();
+    const rect = touchLayer.getBoundingClientRect();
+    const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    if (x < rect.width / 2) {
+      if (stickId !== null) return;
+      stickId = e.pointerId; stickOrigin = [x, y];
+      stick.style.display = "block"; stick.style.left = `${x - 55}px`; stick.style.top = `${y - 55}px`;
+      knob.style.left = "35px"; knob.style.top = "35px";
+    } else {
+      if (kickId !== null) return;
+      kickId = e.pointerId; keys.add("K"); kickBtn.classList.add("on");
+    }
+    try { touchLayer.setPointerCapture(e.pointerId); } catch {}
+  });
+  touchLayer.addEventListener("pointermove", e => {
+    if (e.pointerId !== stickId) return;
+    const rect = touchLayer.getBoundingClientRect();
+    stickMove(e.clientX - rect.left, e.clientY - rect.top);
+  });
+  for (const ev of ["pointerup", "pointercancel"]) touchLayer.addEventListener(ev, e => {
+    if (e.pointerId === stickId) { stickId = null; stick.style.display = "none"; setDir(0, 0); }
+    if (e.pointerId === kickId) { kickId = null; keys.delete("K"); kickBtn.classList.remove("on"); }
+  });
+  const rotateHint = el("rotate");
+  const checkOrientation = () => { rotateHint.hidden = !(isTouch && window.innerHeight > window.innerWidth); };
+  checkOrientation(); addEventListener("resize", checkOrientation);
   let kickArmedLatch = true;  // HaxBall semantics: release to kick again
   function humanAction() {
     const dx = (keys.has("R") ? 1 : 0) - (keys.has("L") ? 1 : 0), dy = (keys.has("D") ? 1 : 0) - (keys.has("U") ? 1 : 0);
