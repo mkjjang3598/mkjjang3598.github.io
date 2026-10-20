@@ -3,7 +3,9 @@
 (async function () {
   "use strict";
   const qs = new URLSearchParams(location.search);
-  const LOG_URL = window.HAXDRILL_LOG_URL || qs.get("log") || "/log";
+  const LOG_BASE = qs.get("log") || window.HAXDRILL_LOG_URL || "";
+  const LOG_URL = LOG_BASE ? LOG_BASE.replace(/\/+$/, "").replace(/\/log$/, "") + "/log" : (location.protocol.startsWith("http") && !location.hostname.endsWith("github.io") ? "/log" : "");
+  const LOG_HEADERS = { "Content-Type": "application/json", "ngrok-skip-browser-warning": "1" };
   const el = id => document.getElementById(id);
   const isTouchDevice = () => (window.matchMedia && matchMedia("(pointer: coarse)").matches) || navigator.maxTouchPoints > 0;
   window.addEventListener("error", e => { try { el("label").textContent = "error: " + (e.message || e.error); } catch (_) {} });
@@ -259,8 +261,9 @@
     const payload = payloadOf(log);
     log = { obs: [], act: [], ep: [], goal: [] };
     pending.push(payload);
+    if (!LOG_URL) { logstat.textContent = ""; return; }
     try {
-      const r = await fetch(LOG_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      const r = await fetch(LOG_URL, { method: "POST", headers: LOG_HEADERS, body: JSON.stringify(payload) });
       if (r.ok) { sent += payload.act.length; pending.splice(pending.indexOf(payload), 1); logstat.textContent = `log uploaded: ${Math.round(sent / 60)}s`; }
       else logstat.textContent = `log kept locally (${pending.length})`;
     } catch { logstat.textContent = `log kept locally (${pending.length})`; }
@@ -328,7 +331,7 @@
     while (acc >= 1000 / 60) { tick(); acc -= 1000 / 60; }
     requestAnimationFrame(frame);
   }
-  addEventListener("beforeunload", () => { if (log.act.length) { try { navigator.sendBeacon(LOG_URL, new Blob([JSON.stringify(payloadOf(log))], { type: "application/json" })); } catch {} } });
+  addEventListener("pagehide", () => { if (LOG_URL && log.act.length) { try { fetch(LOG_URL, { method: "POST", headers: LOG_HEADERS, body: JSON.stringify(payloadOf(log)), keepalive: true }); } catch (_) {} } });
   // level availability: grey out medium if its policy file is missing
   for (const lvl of ["medium", "hard", "expert"]) {
     const b = document.querySelector(`#levelseg [data-level="${lvl}"]`);
