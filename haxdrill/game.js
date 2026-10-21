@@ -3,8 +3,18 @@
 (async function () {
   "use strict";
   const qs = new URLSearchParams(location.search);
-  const LOG_URL = window.HAXDRILL_LOG_URL || qs.get("log") || "/log";
+  const LOG_BASE = qs.get("log") || window.HAXDRILL_LOG_URL || "";
+  const LOG_URL = LOG_BASE ? LOG_BASE.replace(/\/+$/, "").replace(/\/log$/, "") + "/log" : (location.protocol.startsWith("http") && !location.hostname.endsWith("github.io") ? "/log" : "");
+  const LOG_HEADERS = { "Content-Type": "application/json", "ngrok-skip-browser-warning": "1" };
   const el = id => document.getElementById(id);
+  const isTouchDevice = () => (window.matchMedia && matchMedia("(pointer: coarse)").matches) || navigator.maxTouchPoints > 0;
+  window.addEventListener("error", e => { try { el("label").textContent = "error: " + (e.message || e.error); } catch (_) {} });
+  window.addEventListener("unhandledrejection", e => { try { el("label").textContent = "error: " + (e.reason && e.reason.message || e.reason); } catch (_) {} });
+  // state that handlers reference (declared first so a failure further down can never leave it uninitialised)
+  let log = { obs: [], act: [], ep: [], goal: [] }, epId = 0, sent = 0, pending = [];
+  let pol = null, sim = null, n = 1, P = 2, REPEAT = 2, names = [], jerseys = [];
+  const score = [0, 0]; let ticks = 0, pause = 0, lastActs = null, overtime = false, matchOver = false, nextKickoff = 0;
+  const keys = new Set();
   const fail = msg => { el("label").textContent = msg; const sub = document.querySelector("#setup .sub"); if (sub) { sub.textContent = msg; sub.style.color = "#ff9c8a"; } el("start").disabled = true; };
   const FILES = (window.HAXDRILL && window.HAXDRILL.files) || {};
   const cfg = FILES["config.json"];
@@ -14,7 +24,7 @@
   const stored = (() => { try { return JSON.parse(localStorage.getItem("hw_settings") || "{}"); } catch { return {}; } })();
   el("nick").value = qs.get("nick") ?? stored.nick ?? "";
   el("jersey").value = qs.get("jersey") ?? stored.jersey ?? "";
-  el("jersey").addEventListener("input", () => { el("jersey").value = el("jersey").value.replace(/[^\p{L}\p{N}]/gu, "").slice(0, 2); });
+  el("jersey").addEventListener("input", () => { el("jersey").value = el("jersey").value.replace(/[^0-9A-Za-z\u00C0-\uFFFF]/g, "").slice(0, 2); });
   el("players").value = "1";  // public build: 1v1 only (team-play bots are not ready); the engine still supports n>1
   el("level").value = qs.get("level") ?? stored.level ?? "easy";
   el("goals").value = qs.get("goals") ?? stored.goals ?? "3";
@@ -26,8 +36,6 @@
   const timeLimitTicks = () => Math.round((parseFloat(el("mins").value) || 0) * 60 * 60);
 
   // ---------------- match state ----------------
-  let pol = null, sim = null, n = 1, P = 2, REPEAT = 2, names = [], jerseys = [];
-  const score = [0, 0]; let ticks = 0, pause = 0, lastActs = null, overtime = false, matchOver = false, nextKickoff = 0;
   const policyCache = {};
   async function loadPolicy(k, level) {
     const key = `${k}:${level}`;
@@ -80,22 +88,52 @@
     try { await newMatch(); }
     catch (e) { alert(`Could not start: ${e.message}`); return; }
     started = true; paused = false; overlay.classList.add("hidden"); el("start").blur();
+    if (window.HaxSound) HaxSound.unlock();
+    if (isTouchDevice()) {
+      touchHintUntil = performance.now() + 4000;  // shown in the top bar, never over the pitch
+      // maximise: go fullscreen (hides the browser chrome). No orientation lock - rotating keeps working.
+      try { const de = document.documentElement; if (!document.fullscreenElement && de.requestFullscreen) de.requestFullscreen({ navigationUI: "hide" }).catch(() => {}); } catch (_) {}
+    }
   };
   el("settings").onclick = openSettings;
+  const muteBtn = el("mute");
+  const syncMute = () => { muteBtn.textContent = window.HaxSound && HaxSound.isMuted() ? "🔇" : "🔊"; };
+  muteBtn.onclick = () => { if (!window.HaxSound) return; HaxSound.setMuted(!HaxSound.isMuted()); HaxSound.unlock(); syncMute(); muteBtn.blur(); };
+  syncMute();
 
   // ---------------- drawing (mirrors haxdrill/draw.py) ----------------
   const MARGIN = 30, W = 2 * cfg.half_w + 2 * MARGIN, H = 2 * cfg.half_h + 2 * MARGIN;
   const cv = el("c");
   const ctx = cv.getContext("2d");
+  let lastCss = 0;
   function fitCanvas() {
-    const cssW = Math.min(window.innerWidth * 0.96, 1500, Math.max(900, (window.innerHeight - 140) * W / H));
+    let cssW;
+    if (isTouchDevice()) {
+      // size from the *visible* viewport (browser toolbars, notches) so nothing is cut off at the bottom
+      const vv = window.visualViewport;
+      const vw = Math.round(vv ? vv.width : window.innerWidth), vh = Math.round(vv ? vv.height : window.innerHeight);
+      const portrait = vh > vw;
+      const gut = portrait ? 0 : (vw < 600 ? 92 : 100);
+      const barH = el("bar").getBoundingClientRect().height || 32;
+      const reserve = portrait ? 150 : 0;  // portrait: controls live below the pitch
+      cssW = Math.max(200, Math.min(vw - 2 * gut, (vh - barH - 10 - reserve) * W / H));
+      document.documentElement.style.setProperty("--w", `${Math.round(cssW)}px`);
+      document.documentElement.style.setProperty("--vh", `${vh}px`);
+    } else {
+      const avail = window.innerHeight - 140;
+      cssW = Math.min(window.innerWidth * 0.96, 1500, Math.max(900, avail * W / H));
+      document.documentElement.style.setProperty("--w", `${Math.round(cssW)}px`);
+    }
+    if (Math.abs(cssW - lastCss) < 0.5) return;
+    lastCss = cssW;
     const scale = cssW / W, dpr = window.devicePixelRatio || 1;
     cv.width = Math.round(W * scale * dpr); cv.height = Math.round(H * scale * dpr);
-    document.documentElement.style.setProperty("--w", `${Math.round(cssW)}px`);
     ctx.setTransform(scale * dpr, 0, 0, scale * dpr, 0, 0);
   }
   fitCanvas();
   addEventListener("resize", fitCanvas);
+  addEventListener("orientationchange", () => { setTimeout(fitCanvas, 200); setTimeout(fitCanvas, 800); });
+  if (window.visualViewport) window.visualViewport.addEventListener("resize", fitCanvas);
   const px = (x, y) => [x + cfg.half_w + MARGIN, y + cfg.half_h + MARGIN];
   const COL = { canvas: "#1c2d2b", grass: "#718c5a", line: "#c7e6bd", red: "#e56e56", blue: "#5689e5", ball: cfg.ball_color || "#ff1493", postRed: "#ffcccc", postBlue: "#ccccff", net: "#cdcdcd" };
   function circle(x, y, r, fill, stroke, lw) { const [X, Y] = px(x, y); ctx.beginPath(); ctx.arc(X, Y, r, 0, Math.PI * 2); if (fill) { ctx.fillStyle = fill; ctx.fill(); } if (stroke) { ctx.lineWidth = lw || 2; ctx.strokeStyle = stroke; ctx.stroke(); } }
@@ -131,21 +169,86 @@
   }
 
   // ---------------- input ----------------
-  const keys = new Set();
   const KEYMAP = { ArrowLeft: "L", KeyA: "L", ArrowRight: "R", KeyD: "R", ArrowUp: "U", KeyW: "U", ArrowDown: "D", KeyS: "D", KeyX: "K", Space: "K" };
-  const typing = () => ["INPUT", "SELECT"].includes(document.activeElement?.tagName);
+  const typing = () => { const a = document.activeElement; return !!a && (a.tagName === "INPUT" || a.tagName === "SELECT"); };
   addEventListener("keydown", e => {
     if (e.code === "Escape" && started) { if (paused) { paused = false; overlay.classList.add("hidden"); } else openSettings(); return; }
     if (typing() || paused) return;
     if (KEYMAP[e.code]) { keys.add(KEYMAP[e.code]); e.preventDefault(); }
     if (e.code === "KeyR") resetEpisode(0);
+    if (e.code === "KeyM") muteBtn.onclick();
   });
   addEventListener("keyup", e => { if (KEYMAP[e.code]) keys.delete(KEYMAP[e.code]); });
-  for (const b of document.querySelectorAll("#pad button")) {
-    const k = KEYMAP[b.dataset.k];
-    b.addEventListener("pointerdown", e => { keys.add(k); e.preventDefault(); });
-    for (const ev of ["pointerup", "pointerleave", "pointercancel"]) b.addEventListener(ev, () => keys.delete(k));
+  // ---- touch controls: fixed round joystick left of the pitch + KICK right of it. Any touch on the
+  // left half of the play area moves the knob relative to the stick's centre (8 directions). ----
+  const wrap = el("wrap"), stick = el("stick"), knob = el("knob"), kickBtn = el("kickbtn");
+  const isTouch = isTouchDevice();
+  if (isTouch) document.body.classList.add("touch");
+  let padId = null, kickId = null, touchHintUntil = 0;
+  function setDir(dx, dy) {
+    keys.delete("L"); keys.delete("R"); keys.delete("U"); keys.delete("D");
+    if (dx < 0) keys.add("L"); if (dx > 0) keys.add("R"); if (dy < 0) keys.add("U"); if (dy > 0) keys.add("D");
   }
+  function stickFromPoint(clientX, clientY) {
+    const r = stick.getBoundingClientRect();
+    const R = r.width / 2 - 6;
+    let vx = clientX - (r.left + r.width / 2), vy = clientY - (r.top + r.height / 2);
+    const L = Math.hypot(vx, vy);
+    if (L > R) { vx *= R / L; vy *= R / L; }
+    knob.style.transform = `translate(${vx}px, ${vy}px)`;
+    if (L < R * 0.22) { setDir(0, 0); return; }
+    const sector = Math.round(Math.atan2(vy, vx) / (Math.PI / 4));
+    const dirs = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]];
+    const d = dirs[((sector % 8) + 8) % 8];
+    setDir(d[0], d[1]);
+  }
+  function placeTouchControls() {
+    // centre of each control = midpoint between the lower goal post (that side) and the screen's bottom corner
+    if (!isTouch) return;
+    try { placeTouchControlsInner(); } catch (e) { el("label").textContent = "layout error: " + e.message; }
+  }
+  function placeTouchControlsInner() {
+    const wr = wrap.getBoundingClientRect(), c = cv.getBoundingClientRect();
+    const scale = c.width / W;
+    const postY = c.top - wr.top + (cfg.goal_half + cfg.half_h + MARGIN) * scale;            // lower posts (y = +64)
+    const postL = c.left - wr.left + (-cfg.goal_x + cfg.half_w + MARGIN) * scale;            // left post x
+    const postR = c.left - wr.left + (cfg.goal_x + cfg.half_w + MARGIN) * scale;             // right post x
+    const vv = window.visualViewport;
+    const bottom = (vv ? vv.height : window.innerHeight) - wr.top - 6;                       // visible bottom in wrap coords
+    const cy = Math.min(postY + 0.42 * (bottom - postY), bottom - 50);  // a little above the exact midpoint
+    // keep the controls fully on screen (portrait: the posts sit near the screen edge, so the midpoint would be cut off)
+    const rs = stick.getBoundingClientRect().width / 2 + 8, rk = kickBtn.getBoundingClientRect().width / 2 + 8;
+    const sx = Math.max(postL / 2, rs), kx = Math.min((postR + wr.width) / 2, wr.width - rk);
+    stick.style.left = `${sx}px`; stick.style.top = `${cy}px`; stick.style.marginTop = "0";
+    kickBtn.style.left = `${kx}px`; kickBtn.style.top = `${cy}px`; kickBtn.style.marginTop = "0";
+  }
+  function stickRelease() { knob.style.transform = ""; stick.classList.remove("active"); setDir(0, 0); }
+  wrap.addEventListener("pointerdown", e => {
+    if (!isTouch || e.pointerType === "mouse") return;
+    e.preventDefault();
+    const rect = wrap.getBoundingClientRect();
+    if (e.clientX - rect.left < rect.width / 2) {
+      if (padId !== null) return;
+      padId = e.pointerId; stick.classList.add("active"); stickFromPoint(e.clientX, e.clientY);
+    } else {
+      if (kickId !== null) return;
+      kickId = e.pointerId; keys.add("K"); kickBtn.classList.add("on");
+    }
+    try { wrap.setPointerCapture(e.pointerId); } catch (_) {}
+  });
+  wrap.addEventListener("pointermove", e => { if (e.pointerId === padId) stickFromPoint(e.clientX, e.clientY); });
+  ["pointerup", "pointercancel"].forEach(ev => wrap.addEventListener(ev, e => {
+    if (e.pointerId === padId) { padId = null; stickRelease(); }
+    if (e.pointerId === kickId) { kickId = null; keys.delete("K"); kickBtn.classList.remove("on"); }
+  }));
+  document.addEventListener("visibilitychange", () => { if (document.hidden) { padId = kickId = null; stickRelease(); keys.delete("K"); kickBtn.classList.remove("on"); } });
+  const rotateHint = el("rotate");
+  const checkOrientation = () => {
+    const portrait = window.innerHeight > window.innerWidth;
+    document.body.classList.toggle("portrait", isTouch && portrait);
+    rotateHint.hidden = !(isTouch && portrait);
+  };
+  checkOrientation(); addEventListener("resize", checkOrientation);
   let kickArmedLatch = true;  // HaxBall semantics: release to kick again
   function humanAction() {
     const dx = (keys.has("R") ? 1 : 0) - (keys.has("L") ? 1 : 0), dy = (keys.has("D") ? 1 : 0) - (keys.has("U") ? 1 : 0);
@@ -157,16 +260,16 @@
 
   // ---------------- logging ----------------
   const client = (() => { try { let c = localStorage.getItem("hw_client"); if (!c) { c = Math.random().toString(36).slice(2, 10); localStorage.setItem("hw_client", c); } return c; } catch { return "anon"; } })();
-  let log = { obs: [], act: [], ep: [], goal: [] }, epId = 0, sent = 0, pending = [];
   const logstat = el("logstat");
-  const payloadOf = l => ({ n, stadium: cfg.stadium, client, name: names[0] || "", obs: l.obs, act: l.act, ep: l.ep, goal: l.goal });
+  const payloadOf = l => ({ n, stadium: cfg.stadium, client, name: names[0] || "", policy: (pol && pol._file) || "", obs: l.obs, act: l.act, ep: l.ep, goal: l.goal });
   async function flushLog() {
     if (!log.act.length) return;
     const payload = payloadOf(log);
     log = { obs: [], act: [], ep: [], goal: [] };
     pending.push(payload);
+    if (!LOG_URL) { logstat.textContent = ""; return; }
     try {
-      const r = await fetch(LOG_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      const r = await fetch(LOG_URL, { method: "POST", headers: LOG_HEADERS, body: JSON.stringify(payload) });
       if (r.ok) { sent += payload.act.length; pending.splice(pending.indexOf(payload), 1); logstat.textContent = `log uploaded: ${Math.round(sent / 60)}s`; }
       else logstat.textContent = `log kept locally (${pending.length})`;
     } catch { logstat.textContent = `log kept locally (${pending.length})`; }
@@ -179,6 +282,10 @@
 
   // ---------------- game loop ----------------
   function resetEpisode(kickoff = nextKickoff) { if (!sim) return; sim.reset(kickoff); epId++; lastActs = null; nextKickoff = 0; }
+  function playKickSounds() {
+    if (!window.HaxSound) return;
+    for (let p = 0; p < P; p++) if (sim.kicked[p]) HaxSound.kick(p === 0 ? 1 : 0.7);
+  }
   function endMatch(w) { el("goal").textContent = `${w === 0 ? "Red" : "Blue"} Wins!  ${score[0]} - ${score[1]}`; matchOver = true; pause = 180; }
   function tick() {
     if (!sim || paused) { if (sim) draw(false); return; }
@@ -196,6 +303,7 @@
       // celebration: physics keeps running (ball flies into the net, players keep moving), no new goals
       pause--;
       sim.step(acts);
+      playKickSounds();
       if (sim.kicked[0]) kickArmedLatch = false;
       if (pause === 0) {
         el("goal").textContent = "";
@@ -207,9 +315,11 @@
     const inKickoff = sim.kickoffTeam >= 0;
     const g = sim.step(acts);
     log.obs.push(...state.map(v => Math.round(v * 1000) / 1000)); log.act.push(aHuman); log.ep.push(epId); log.goal.push(g);
+    playKickSounds();
     if (sim.kicked[0]) kickArmedLatch = false;
     if (!inKickoff) ticks++;  // the match clock waits for the kick-off
     if (g >= 0) {
+      if (window.HaxSound) HaxSound.goal();
       score[g]++; el("sr").textContent = score[0]; el("sb").textContent = score[1];
       el("goal").textContent = g === 0 ? "Red Scores!" : "Blue Scores!";
       nextKickoff = 1 - g;  // the conceding team kicks off
@@ -222,20 +332,25 @@
     const s = Math.floor(ticks / 60), tl = timeLimitTicks() / 60;
     const fmt = v => `${String(Math.floor(v / 60)).padStart(2, "0")}:${String(Math.floor(v % 60)).padStart(2, "0")}`;
     el("time").textContent = overtime ? `${fmt(s)}  OVERTIME` : tl ? `${fmt(s)} / ${fmt(tl)}` : fmt(s);
-    const lvl = pol._file && pol._file.includes("_medium.") ? "medium" : "easy";
+    const lvl = (pol._file && (pol._file.match(/_(medium|hard|expert)\./) || [])[1]) || "easy";
     const base = `${n}v${n} · ${names[0]} vs bot [${lvl}]`;
-    el("label").textContent = sim.kickoffTeam >= 0 ? `${sim.kickoffTeam === 0 ? "Red" : "Blue"} kick-off · ${base}` : base;
+    el("label").textContent = performance.now() < touchHintUntil ? "stick: move · KICK: hold" : (sim.kickoffTeam >= 0 ? `${sim.kickoffTeam === 0 ? "Red" : "Blue"} kick-off · ${base}` : base);
     draw(kicking);
   }
   let acc = 0, last = performance.now();
   function frame(now) {
+    fitCanvas(); placeTouchControls();
     acc += Math.min(100, now - last); last = now;
     while (acc >= 1000 / 60) { tick(); acc -= 1000 / 60; }
     requestAnimationFrame(frame);
   }
-  addEventListener("beforeunload", () => { if (log.act.length) { try { navigator.sendBeacon(LOG_URL, new Blob([JSON.stringify(payloadOf(log))], { type: "application/json" })); } catch {} } });
+  addEventListener("pagehide", () => { if (LOG_URL && log.act.length) { try { fetch(LOG_URL, { method: "POST", headers: LOG_HEADERS, body: JSON.stringify(payloadOf(log)), keepalive: true }); } catch (_) {} } });
   // level availability: grey out medium if its policy file is missing
-  if (!FILES["policy_n1_medium.json"]) { const b = document.querySelector('#levelseg [data-level="medium"]'); b.disabled = true; b.title = "medium bot not available yet"; if (el("level").value === "medium") { el("level").value = "easy"; wireSeg("levelseg", "level", "level"); } }
+  for (const lvl of ["medium", "hard", "expert"]) {
+    const b = document.querySelector(`#levelseg [data-level="${lvl}"]`);
+    if (FILES[`policy_n1_${lvl}.json`]) { b.disabled = false; b.title = ""; const small = b.querySelector("small"); if (small) small.remove(); }
+    else { b.disabled = true; b.title = `${lvl} bot not available yet`; if (el("level").value === lvl) { el("level").value = "easy"; wireSeg("levelseg", "level", "level"); } }
+  }
   el("label").textContent = "choose your settings and press Play";
   openSettings();
   requestAnimationFrame(frame);
